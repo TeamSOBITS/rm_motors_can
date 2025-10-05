@@ -49,9 +49,9 @@ pub extern "C" fn nm_per_a(motor_type: MotorType) -> f64 {
         MotorType::M2006  => 0.338, // approximated from datasheet graph
     }
 }
-pub const V_MAX      : f64 =  24.0;  // Volts DC
-pub const TEMP_MAX   : u8  = 125;    // C
-const V_CMD_MAX: f64 = 25000.0;     // V_MAX maps to V_CMD_MAX in the CAN messages
+pub const V_MAX      : f64 =  24.0;   // Volts DC
+pub const TEMP_MAX   : u8  = 125;     // C
+const V_CMD_MAX      : f64 = 25000.0; // V_MAX maps to V_CMD_MAX in the CAN messages
 // I_MAX maps to I_CMD_MAX in the CAN messages
 #[no_mangle]
 pub extern "C" fn i_cmd_max(motor_type: MotorType) -> f64 {
@@ -338,20 +338,20 @@ pub fn set_cmd(rm_motors_can: Arc<RmMotorsCan>, id: u8, cmd: f64) -> Result<i32,
     let mut mode: CmdMode = rm_motors_can.modes.read().unwrap()[idx];
     let motor_type: MotorType = rm_motors_can.motor_types.read().unwrap()[idx];
     let mut cmd_actual: f64 = cmd;
-    // Convert torque and velocity commands to corresponding current and voltage commands
-    if mode == CmdMode::Torque {
+    // Convert torque and velocity commands to current commands
+    if mode == CmdMode::Torque || mode == CmdMode::Velocity {
         mode = CmdMode::Current;
         cmd_actual/=nm_per_a(motor_type);
     }
-    if mode == CmdMode::Velocity {
-        mode = CmdMode::Voltage;
-        cmd_actual*=RPM_PER_ANGULAR/RPM_PER_V;
-    }
-    // Limit to max allowable command values
-    if mode == CmdMode::Voltage && cmd_actual.abs() > V_MAX {
-        eprintln!("Warning: voltage out of range [{}, {}]: {}. Clamping.", -1.0*V_MAX, V_MAX, cmd);
-        cmd_actual = V_MAX*cmd.abs()/cmd;
-    }
+    // if mode == CmdMode::Velocity {
+    //     mode = CmdMode::Voltage;
+    //     cmd_actual*=RPM_PER_ANGULAR/RPM_PER_V;
+    // }
+    // Limit to max allowable command values (
+    // if mode == CmdMode::Voltage && cmd_actual.abs() > V_MAX {
+    //     eprintln!("Warning: voltage out of range [{}, {}]: {}. Clamping.", -1.0*V_MAX, V_MAX, cmd);
+    //     cmd_actual = V_MAX*cmd.abs()/cmd;
+    // }
     let i_max: f64 = i_max(motor_type);
 
     if mode == CmdMode::Current && cmd_actual.abs() > i_max {
@@ -448,9 +448,9 @@ pub fn get_state(rm_motors_can: Arc<RmMotorsCan>, id: u8, field: FbField) -> Res
         return Err(format!("Motor {} is an M2006, which does not report {}", id, field));
     }
     Ok(match field {
-        FbField::Position    => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.position as f64/POS_MAX as f64 *2f64*PI,
-        FbField::Velocity    => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.velocity as f64/RPM_PER_ANGULAR,
-        FbField::Current     => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.current as f64/i_cmd_max(motor_type)*i_max(motor_type),
-        FbField::Temperature => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.temperature as f64,
+        FbField::Position    => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.position as f64/POS_MAX as f64 *2f64*PI,                  // radians
+        FbField::Velocity    => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.velocity as f64/RPM_PER_ANGULAR,                          // radians per second
+        FbField::Current     => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.current as f64/i_cmd_max(motor_type)*i_max(motor_type),   // Amps
+        FbField::Temperature => rm_motors_can.feedbacks.read().unwrap()[(id-1)as usize].1.temperature as f64,                                       // Celsius
     })
 }
