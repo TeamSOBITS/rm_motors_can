@@ -186,7 +186,7 @@ pub fn init_bus(interface: &str) -> Result<Arc<RmMotorsCan>, String> {
 }
 
 pub fn init_motor(rm_motors_can: Arc<RmMotorsCan>, id: u8, motor_type: MotorType, mode: CmdMode) -> Result<i32, String> {
-    if (motor_type == MotorType::M3508 || motor_type == MotorType::M2006) && (mode == CmdMode::Voltage || mode == CmdMode::Velocity){
+    if (motor_type == MotorType::M2006) && (mode == CmdMode::Voltage || mode == CmdMode::Velocity){
         return Err(format!("Attempting to initialize motor {} in {} mode, but it is an {} which only accepts Current or Torque commands", id, mode, motor_type));
     }
     let idx: usize = (id-1) as usize;
@@ -288,7 +288,7 @@ pub fn run_once(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String>{
             CmdMode::Current  => CmdMode::Current,
             CmdMode::Torque   => CmdMode::Current,
             CmdMode::Voltage  => CmdMode::Voltage,
-            CmdMode::Velocity => CmdMode::Voltage,
+            CmdMode::Velocity => CmdMode::Current,
             CmdMode::Disabled => CmdMode::Disabled,
         };
         if mode == CmdMode::Disabled {continue;}
