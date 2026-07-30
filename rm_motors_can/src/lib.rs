@@ -126,6 +126,9 @@ struct Feedback {
 // Technically we could handle more than 8 motors at once since the M3508 and GM6020 ID ranges only
 // partially overlap. However, that would greatly complicate things and it is a rare use case.
 const ARR_LEN: usize = 8;
+// A standard (non-FD) CAN data frame carries at most 8 bytes. Unrelated to ARR_LEN
+// (motor slot count) even though both are currently 8.
+const CAN_FRAME_LEN: usize = 8;
 #[derive(Default)]
 #[repr(C)]
 pub struct RmMotorsCan {
@@ -431,7 +434,7 @@ fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
                 let rxid: u16 = frame.raw_id() as u16;
                 // 0x200 is a command id, not feedback -- it would map to motor 0 and
                 // underflow below. Short frames would panic the data slice. Skip both.
-                if rxid <= FB_ID_BASE_3508 || frame.data().len() < ARR_LEN {
+                if rxid <= FB_ID_BASE_3508 || frame.data().len() < CAN_FRAME_LEN {
                     continue;
                 }
                 let id: u8;
@@ -449,7 +452,7 @@ fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
 
                 // Get a reference to the feedback object and data array to simplify the parsing code
                 let f: &mut (Option<SystemTime>, Feedback) = &mut rm_motors_can.feedbacks.write().unwrap()[(id-1) as usize];
-                let d: &[u8] = &frame.data()[0..ARR_LEN];
+                let d: &[u8] = &frame.data()[0..CAN_FRAME_LEN];
                 // Pull the feedback values out of the data array and save them in the feedback object
                 f.0 = Some(SystemTime::now());// TODO waiting on socketcan library to implement hardware timestamps
                 f.1.position    = (d[0] as u16) << 8 | d[1] as u16;
