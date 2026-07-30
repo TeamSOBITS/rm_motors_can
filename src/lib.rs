@@ -49,8 +49,23 @@ macro_rules! generate_wrapper {
 generate_wrapper!(init_motor, (id: u8, motor_type: MotorType, mode: CmdMode), i32);
 generate_wrapper!(cleanup,    (period_ms: u64), i32);
 generate_wrapper!(run_once,   (), i32);
+generate_wrapper!(rx_once,    (), i32);
 generate_wrapper!(set_cmd,    (id: u8, cmd: f64), i32);
-generate_wrapper!(get_state,  (id: u8, field: FbField), f64);
+generate_wrapper!(fb_age_ms,  (id: u8), i64);
+
+// Dedicated wrapper (not the macro) so errors return NaN, not -1 -- a sentinel
+// indistinguishable from a real reading in rad, rad/s, or A.
+#[no_mangle]
+pub extern "C" fn get_state(rm_motors_can: *mut RmMotorsCan, id: u8, field: FbField) -> f64 {
+    if rm_motors_can.is_null(){
+        println!("Invalid handle (null pointer)");
+        return f64::NAN;
+    }
+    let rm_motors_can: Arc<RmMotorsCan> = unsafe { Arc::from_raw(rm_motors_can as *const RmMotorsCan) };
+    let rm_motors_can_ref2 = Arc::clone(&rm_motors_can);
+    std::mem::forget(rm_motors_can);
+    rm_motors_can::get_state(rm_motors_can_ref2, id, field).unwrap_or(f64::NAN)
+}
 
 
 #[link(name = "rm_motors_can_test_cpp")]

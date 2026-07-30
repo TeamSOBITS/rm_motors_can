@@ -135,6 +135,7 @@ pub struct RmMotorsCan {
     commands    : RwLock<[i16; ARR_LEN]>,
     feedbacks   : RwLock<[(Option<SystemTime>, Feedback); ARR_LEN]>,
     upper_3508  : RwLock<bool>, // if true, parse CAN ID range 0x205-0x208 as m3508/m2006
+    fb_warned   : RwLock<[bool; ARR_LEN]>, // per-motor "no feedback" already warned (reset on reception)
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -159,10 +160,15 @@ pub fn init_bus(interface: &str) -> Result<Arc<RmMotorsCan>, String> {
     let socket: CanSocket = CanSocket::open(&interface).map_err(|err| err.to_string())?;  // Attempt to open the given interface
 
     // Listen for 100ms to check if a CAN bus driver is already running- don't want to send conflicting commands.
+    // Use a timed read: a blocking read_frame on a silent bus (motors unpowered) would hang forever.
     let t: SystemTime = SystemTime::now();
     while t.elapsed().map_err(|err| err.to_string())?.as_millis() < 100 {
-        match socket.read_frame(){
-            Err(err) => {return Err(err.to_string())},
+        match socket.read_frame_timeout(Duration::from_millis(20)){
+            Err(err) => {
+                if err.kind() != std::io::ErrorKind::TimedOut && err.kind() != std::io::ErrorKind::WouldBlock {
+                    return Err(err.to_string());
+                }
+            },
             Ok(CanFrame::Remote(_)) => (),
             Ok(CanFrame::Error(_)) => (),
             Ok(CanFrame::Data(frame)) => {
@@ -176,6 +182,8 @@ pub fn init_bus(interface: &str) -> Result<Arc<RmMotorsCan>, String> {
 
     let filter: CanFilter = CanFilter::new(FB_ID_BASE_3508 as u32, 0xffff - 0xf);  // Create a filter to only accept messages with IDs from 0x200 to 0x20F (Motor feedbacks are 0x201 to 0x20B)
     socket.set_filters(&[filter]).map_err(|err| err.to_string())?;            // Apply the filter to our interface
+    // Bound the write so a full TX queue (bus-off) can't block the RT loop forever.
+    socket.set_write_timeout(Duration::from_millis(5)).map_err(|err| err.to_string())?;
     *rm_motors_can.socket.lock().unwrap() = Some(socket);                        // Attach the socket to the rm_motors_can object for future reading and writing
 
     // Read frames to populate feedbacks - this prevents run_once from thinking motors aren't initialized
@@ -272,11 +280,19 @@ pub fn cleanup(rm_motors_can: Arc<RmMotorsCan>, period_ms: u64) -> Result<i32, S
     for thread in threads.into_iter() {
         thread.join().expect("Couldn't join the cleanup thread");
     }
+    // Release the socket so a subsequent init_bus on the same interface starts clean
+    *rm_motors_can.socket.lock().unwrap() = None;
     Ok(0)
 }
 
 
 
+
+// Receive-only variant of run_once, for read(): commands go out exactly once
+// per cycle, from write()'s tx_cmd calls.
+pub fn rx_once(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String>{
+    rx_fb(rm_motors_can)
+}
 
 pub fn run_once(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String>{
     rx_fb(rm_motors_can.clone())?;
@@ -377,13 +393,13 @@ pub fn set_cmd(rm_motors_can: Arc<RmMotorsCan>, id: u8, cmd: f64) -> Result<i32,
 fn tx_cmd(rm_motors_can: Arc<RmMotorsCan>, frame_id: u16, id_range: IdRange) -> Result<i32, String> {
     // Slice half of the commands array, depending on the id range
     let cmds: &[i16] = &rm_motors_can.commands.read().unwrap()[((id_range as u8) * 4) as usize .. (4 + (id_range as u8)*4) as usize];
-    // Construct a CAN frame using the ID and cmds data
+    // No unwrap()s: a panic across the FFI boundary aborts the whole caller process.
     let frame = CanFrame::new(
-        StandardId::new(frame_id).unwrap(),
+        StandardId::new(frame_id).ok_or_else(|| format!("Invalid CAN id: {:#x}", frame_id))?,
         &[(cmds[0]>>8) as u8, cmds[0] as u8, (cmds[1]>>8) as u8, cmds[1] as u8, (cmds[2]>>8) as u8, cmds[2] as u8, (cmds[3]>>8) as u8, cmds[3] as u8])
-        .ok_or_else(|| Err::<CanFrame, String>("Failed to open socket".to_string())).unwrap();
-    // Write the frame
-    rm_motors_can.socket.lock().unwrap().as_ref().ok_or_else(|| Err::<CanSocket, String>("Socket not initialized".to_string())).unwrap().write_frame(&frame).map_err(|err| err.to_string())?;
+        .ok_or_else(|| "Failed to construct CAN frame".to_string())?;
+    // Write the frame (bounded by the socket write timeout set in init_bus)
+    rm_motors_can.socket.lock().unwrap().as_ref().ok_or_else(|| "Socket not initialized".to_string())?.write_frame(&frame).map_err(|err| err.to_string())?;
     Ok(0)
 }
 
@@ -395,24 +411,29 @@ fn tx_cmd(rm_motors_can: Arc<RmMotorsCan>, frame_id: u16, id_range: IdRange) -> 
 **  frame: the CAN frame to parse
 */
 fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
-    // If a motor is not Disabled did not report any feedback for 100ms, report an error
-    for i in 0 .. ARR_LEN {
-        if rm_motors_can.modes.read().unwrap()[i] != CmdMode::Disabled && rm_motors_can.feedbacks.read().unwrap()[i].0.ok_or_else(|| format!("Motor {} never responded.", (i as u8)+ID_MIN))?.elapsed().map_err(|err| err.to_string())?.as_millis() >= 100 {
-            eprintln!("Haven't heard from Motor {} in over 100ms. Are you reading frequently enough?", (i as u8)+ID_MIN);
-        }
-    }
-
-    // Read all available frames from buffer
+    // Drain frames FIRST -- erroring out before reading meant a motor that missed
+    // the init window could never be heard from again (permanent no-TX deadlock).
     let mut timed_out: bool = false;
     while !timed_out {
         // Keep timeout very short because we don't want to wait for new frames to arrive
-        match rm_motors_can.socket.lock().unwrap().as_ref().ok_or_else(|| Err::<CanSocket, String>("Socket not initialized".to_string())).unwrap().read_frame_timeout(Duration::from_micros(1)){
-            Err(err) => if err.to_string() == "timed out" {timed_out=true} else {return Err(err.to_string())}
+        match rm_motors_can.socket.lock().unwrap().as_ref().ok_or_else(|| "Socket not initialized".to_string())?.read_frame_timeout(Duration::from_micros(1)){
+            Err(err) => {
+                if err.kind() == std::io::ErrorKind::TimedOut || err.kind() == std::io::ErrorKind::WouldBlock || err.to_string() == "timed out" {
+                    timed_out = true;
+                } else {
+                    return Err(err.to_string());
+                }
+            },
             Ok(CanFrame::Remote(_)) => (), // The mask on the socket isn't a perfect match, so it's possible we receive a remote frame for another device with a nearby id
             Ok(CanFrame::Error(frame)) => eprintln!("{:?}", frame), // The datasheet didn't mention any error frames but we might as well print them
             Ok(CanFrame::Data(frame)) => {
                 // Convert CAN frame ID to motor ID
                 let rxid: u16 = frame.raw_id() as u16;
+                // 0x200 is a command id, not feedback -- it would map to motor 0 and
+                // underflow below. Short frames would panic the data slice. Skip both.
+                if rxid <= FB_ID_BASE_3508 || frame.data().len() < ARR_LEN {
+                    continue;
+                }
                 let id: u8;
                 // M3508 ID range
                 if rxid <= 0x204 || (rxid > 0x204 && rxid <= 0x208 && *rm_motors_can.upper_3508.read().unwrap()) {
@@ -435,10 +456,38 @@ fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
                 f.1.velocity    = (d[2] as i16) << 8 | d[3] as i16;
                 f.1.current     = (d[4] as i16) << 8 | d[5] as i16;
                 f.1.temperature = d[6] as u16;
+                rm_motors_can.fb_warned.write().unwrap()[(id-1) as usize] = false;
             },
         };
     }
+
+    // Warn once per outage; never fail the cycle over it (see fb_age_ms).
+    for i in 0 .. ARR_LEN {
+        if rm_motors_can.modes.read().unwrap()[i] == CmdMode::Disabled { continue; }
+        let stale: bool = match rm_motors_can.feedbacks.read().unwrap()[i].0 {
+            None => true,
+            Some(t) => t.elapsed().map_err(|err| err.to_string())?.as_millis() >= 100,
+        };
+        if stale && !rm_motors_can.fb_warned.read().unwrap()[i] {
+            eprintln!("No feedback from Motor {} for over 100ms (or ever).", (i as u8)+ID_MIN);
+            rm_motors_can.fb_warned.write().unwrap()[i] = true;
+        }
+    }
     Ok(0)
+}
+
+/*
+**  Age of the most recent feedback for a motor, in milliseconds.
+**  Returns i64::MAX if the motor has never responded.
+*/
+pub fn fb_age_ms(rm_motors_can: Arc<RmMotorsCan>, id: u8) -> Result<i64, String> {
+    if id < ID_MIN || id as usize > ARR_LEN {
+        return Err(format!("id out of range [{}, {}]: {}", ID_MIN, ARR_LEN, id));
+    }
+    match rm_motors_can.feedbacks.read().unwrap()[(id-1) as usize].0 {
+        None => Ok(i64::MAX),
+        Some(t) => Ok(t.elapsed().map_err(|err| err.to_string())?.as_millis() as i64),
+    }
 }
 
 
