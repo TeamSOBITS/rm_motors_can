@@ -11,7 +11,7 @@ This Rust library controls DJI RoboMaster motors over a Linux SocketCAN interfac
 | Voltage  | V     | 24   |  24 |   24 |
 | Current  | A     | 1.62 |  20 |   10 |
 | Velocity | rad/s | 33.5 | 482 |  500 |
-| Torque   | N*m   | 1.2  |   5 | 1.75 |
+| Torque   | N*m   | 1.2  |   6 | 1.75 |
 
 </td><td></td><td></td><td>
 
