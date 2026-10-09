@@ -4,6 +4,7 @@ use std::f64::consts::PI;
 use std::time::Duration;
 use embedded_can::{Frame as EmbeddedFrame, StandardId};
 use std::time::SystemTime;
+use std::time::Instant; // feedback timestamps: monotonic, so a chrony clock step can't break staleness checks
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
@@ -45,7 +46,7 @@ pub extern "C" fn i_max(motor_type: MotorType) -> f64 {
 pub extern "C" fn nm_per_a(motor_type: MotorType) -> f64 {
     match motor_type {
         MotorType::GM6020 => 0.741,
-        MotorType::M3508  => 0.353, // approximated from datasheet graph
+        MotorType::M3508  => 0.3, // DJI M3508 P19 user guide: rated torque constant at the output shaft
         MotorType::M2006  => 0.338, // approximated from datasheet graph
     }
 }
@@ -136,7 +137,7 @@ pub struct RmMotorsCan {
     motor_types : RwLock<[MotorType; ARR_LEN]>,
     modes       : RwLock<[CmdMode; ARR_LEN]>,
     commands    : RwLock<[i16; ARR_LEN]>,
-    feedbacks   : RwLock<[(Option<SystemTime>, Feedback); ARR_LEN]>,
+    feedbacks   : RwLock<[(Option<Instant>, Feedback); ARR_LEN]>,
     upper_3508  : RwLock<bool>, // if true, parse CAN ID range 0x205-0x208 as m3508/m2006
     fb_warned   : RwLock<[bool; ARR_LEN]>, // per-motor "no feedback" already warned (reset on reception)
 }
@@ -451,10 +452,10 @@ fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
                 }
 
                 // Get a reference to the feedback object and data array to simplify the parsing code
-                let f: &mut (Option<SystemTime>, Feedback) = &mut rm_motors_can.feedbacks.write().unwrap()[(id-1) as usize];
+                let f: &mut (Option<Instant>, Feedback) = &mut rm_motors_can.feedbacks.write().unwrap()[(id-1) as usize];
                 let d: &[u8] = &frame.data()[0..CAN_FRAME_LEN];
                 // Pull the feedback values out of the data array and save them in the feedback object
-                f.0 = Some(SystemTime::now());// TODO waiting on socketcan library to implement hardware timestamps
+                f.0 = Some(Instant::now());// TODO waiting on socketcan library to implement hardware timestamps
                 f.1.position    = (d[0] as u16) << 8 | d[1] as u16;
                 f.1.velocity    = (d[2] as i16) << 8 | d[3] as i16;
                 f.1.current     = (d[4] as i16) << 8 | d[5] as i16;
@@ -469,7 +470,7 @@ fn rx_fb(rm_motors_can: Arc<RmMotorsCan>) -> Result<i32, String> {
         if rm_motors_can.modes.read().unwrap()[i] == CmdMode::Disabled { continue; }
         let stale: bool = match rm_motors_can.feedbacks.read().unwrap()[i].0 {
             None => true,
-            Some(t) => t.elapsed().map_err(|err| err.to_string())?.as_millis() >= 100,
+            Some(t) => t.elapsed().as_millis() >= 100, // Instant::elapsed() is monotonic, can't fail
         };
         if stale && !rm_motors_can.fb_warned.read().unwrap()[i] {
             eprintln!("No feedback from Motor {} for over 100ms (or ever).", (i as u8)+ID_MIN);
@@ -489,7 +490,7 @@ pub fn fb_age_ms(rm_motors_can: Arc<RmMotorsCan>, id: u8) -> Result<i64, String>
     }
     match rm_motors_can.feedbacks.read().unwrap()[(id-1) as usize].0 {
         None => Ok(i64::MAX),
-        Some(t) => Ok(t.elapsed().map_err(|err| err.to_string())?.as_millis() as i64),
+        Some(t) => Ok(t.elapsed().as_millis() as i64),
     }
 }
 
